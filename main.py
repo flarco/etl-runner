@@ -9,7 +9,6 @@ print(paths)
 from __future__ import with_statement
 from com.ziclix.python.sql import zxJDBC
 from helpers import settings, get_rec
-from arg_parser import parser_args
 
 cred = settings['databases']['xenial_pg']
 conn = zxJDBC.connect(cred['url'], cred['username'], cred['password'], cred['driver'])
