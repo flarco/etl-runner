@@ -2,6 +2,17 @@
 
 Run simple ETL operations between database systems using the JVM (Jython).
 
+## Operations to be implemented
+  - Support:
+    - Oracle
+    - ~~SQL Server~~
+    - ~~PostgreSQL~~
+    - ~~MySQL~~
+    - MongoDB
+    - SQLite
+    - CSV
+  - Pass-through ETL.
+  - Automatically create table in target (if not exists)
 
 ## Set CLASSPATH
 <http://www.jython.org/jythonbook/en/1.0/DatabasesAndJython.html#getting-started>
