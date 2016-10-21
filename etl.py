@@ -255,7 +255,7 @@ def main():
       limit=parser_args.limit,
     )
   
-    log(get_elapsed_time())
+  log(get_elapsed_time())
 
 main()
 
