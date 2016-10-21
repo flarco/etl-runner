@@ -1,5 +1,5 @@
 from __future__ import with_statement
-import sys
+import sys, datetime
 from com.ziclix.python.sql import zxJDBC
 from arg_parser import parser_args
 from sql import sql_select_columns
@@ -18,6 +18,7 @@ DATA_TYPE_MAP = {
   'integer' : 'int',
   'int' : 'int',
   'money' : 'numeric',
+  'numeric' : 'numeric',
   'date' : 'date',
   'datetime' : 'datetime',
   'character varying' : 'varchar',
@@ -32,7 +33,7 @@ class Conn:
     self.cred = cred
     self.conn = zxJDBC.connect(cred['url'], cred['username'], cred['password'], cred['driver'])
     self.cursor = self.conn.cursor(True)  # Dynamic cursor
-    
+    self.convert_warned = False
     self.get_type()
 
   def get_type(self):
@@ -52,7 +53,7 @@ class Conn:
     elif 'sqlserver' in url:
       self.type = "Microsoft SQL Server"
       self.type_ = "sqlserver"
-      self.limit_templ = 'LIMIT {}'
+      self.limit_templ = 'TOP {}'
 
     elif 'mysql' in url:
       self.type = "MySQL"
@@ -70,30 +71,71 @@ class Conn:
   
   def get_select_sql(self, table, limit=None):
     limit_str = self.limit_templ.format(limit) if limit else ''
-    sql='select * from {} WHERE 1=1 {}'.format(table, limit_str)
+    sql='select {prefix} * from {from_table} WHERE 1=1 {where} {suffix}'.format(
+      prefix=limit_str if self.type_ == 'sqlserver' else '',
+      from_table=table,
+      where='',
+      suffix=limit_str if self.type_ != 'sqlserver' else ''
+    )
     return sql
   
   def fetch_size(self, size):
-    data = self.cursor.fetchmany(size)
+    
+    def is_date(val):
+      try:
+        d=datetime.datetime.strptime(val, '%Y-%m-%d')
+        return True
+      except:
+        return False
+
+    try:
+      data = self.cursor.fetchmany(size)
+    except zxJDBC.DatabaseError:
+      return []
+
     if self.type_ == 'sqlserver':
-      # check if contains date
-      pass
+      # check if contains date because it converts to string (datetime is fine)
+      i_to_check={i:False for i,d in enumerate(self.cursor.description) if d[1] == -9 and d[2] == 10 }
+      
+      rows_to_audit = min(10, len(data))
+      for ri in range(rows_to_audit):
+        row = data[ri]
+        for i in i_to_check:
+          if is_date(row[i]):
+            i_to_check[i] = True
+      
+      if any(i_to_check.values()):
+        if not self.convert_warned:
+          log(" >> Need to convert DATE values from string to datetime.. Will take longer than usual.")
+          self.convert_warned = True
+
+        i_to_do = [k for k,v in i_to_check.items() if v]
+
+        data2 = []
+        for row in data:
+          row = list(row)
+          for i in i_to_do:
+            row[i] = datetime.datetime.strptime(row[i], '%Y-%m-%d')
+          data2.append(row)
+        return data2
+
     return data
 
 
 def init_connections():
   "Connect to source / target databases"
   conns = {}
-  for conn_name in [parser_args.source_conn,parser_args.target_conn]:
+  for conn_ in ['source_conn','target_conn']:
+    conn_name = parser_args[conn_]
     if not conn_name in settings['databases']:
       log('Connection {} not found in settings.yml!'.format(conn_name))
       sys.exit(1)
     
     cred = settings['databases'][conn_name]
-    conns[conn_name] = Conn(cred)
+    conns[conn_] = Conn(cred)
     log('Connected to {} -> {}'.format(conn_name, cred['url']))
   
-  return conns
+  return conns['source_conn'], conns['target_conn']
 
 
 def run_etl(s_conn,t_conn,source_table,
@@ -143,18 +185,25 @@ def run_etl(s_conn,t_conn,source_table,
   select_sql = s_conn.get_select_sql(source_table, limit)
   if show_details: log(select_sql)
 
+  etl_time_start = datetime.datetime.now()
   s_conn.cursor.execute(select_sql)
 
   insert_statement = 'INSERT INTO {table} ({names}) VALUES {values}'
   names = ','.join(['"' + f['column_name'] + '"' for f in t_fields])
   
   record_count = 0
+  inc = 0
   while True:
     data = s_conn.fetch_size(batch_size)
     if len(data) == 0: break
     
     record_count += len(data)
-    log('  > row {}...'.format(record_count))
+    inc += len(data)
+
+    if inc > 10000:
+      log('  > row {}...'.format(record_count))
+      inc = 0
+
     values_placeh = '(' + ','.join(['?'] * len(t_fields)) + ')'
     insert_sql = insert_statement.format(
       table=target_table,
@@ -167,16 +216,21 @@ def run_etl(s_conn,t_conn,source_table,
       t_conn.conn.commit()
     except:
       if show_details: log(insert_sql)
-      if show_details: log(data)
+      if show_details:
+        l = min(20,len(data))
+        log(data[:l-1])
+      
       print(get_exception_message())
       sys.exit(1)
-
-  log('Inserted {} records in {}.'.format(record_count, target_table))
+  
+  etl_time_delta = (datetime.datetime.now() - etl_time_start).total_seconds()
+  log('Inserted {} records into {} in {} seconds [{} rec/sec].'.format(record_count, target_table, etl_time_delta, round(record_count/etl_time_delta,1)))
+  return record_count
   
 
 def main():
   "Run ETL"
-  conns = init_connections()
+  source_conn,target_conn = init_connections()
 
   source_tables = parser_args.source_table.split(',')
   target_tables = parser_args.target_table.split(',')
@@ -190,9 +244,9 @@ def main():
 
     parser_args.batch_size = int(parser_args.batch_size) if parser_args.batch_size else 5000
     
-    run_etl(
-      s_conn=conns[parser_args.source_conn],
-      t_conn=conns[parser_args.target_conn],
+    r_count = run_etl(
+      s_conn=source_conn,
+      t_conn=target_conn,
       source_table=source_table,
       target_table=target_table,
       show_details=parser_args.show_details,
@@ -201,7 +255,7 @@ def main():
       limit=parser_args.limit,
     )
   
-  log(get_elapsed_time())
+    log(get_elapsed_time())
 
 main()
 

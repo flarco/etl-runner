@@ -60,8 +60,11 @@ def fetch_to_array_dict(cursor, size=None):
 
 def get_elapsed_time():
   time_end = datetime.datetime.now().now()
+  # delta_seconds= (time_end - time_start).total_seconds()
+  # return delta_seconds
+
   delta_time = divmod((time_end - time_start).days * 86400 + (time_end - time_start).seconds, 60)
-  return(str(delta_time[0]) + ' mins ' + str(delta_time[1]) + ' seconds elapsed')
+  return str(delta_time[0]) + ' mins ' + str(delta_time[1]) + ' seconds elapsed'
 
 def get_exception_message(append_message = ''):
     import linecache
