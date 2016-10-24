@@ -2,8 +2,20 @@ from __future__ import with_statement
 import sys, datetime
 from com.ziclix.python.sql import zxJDBC
 from arg_parser import parser_args
-from sql import sql_select_columns
+from sql import (
+  sql_select_columns,
+  sql_insert,
+)
 from itertools import chain
+import java.util.Date, java.sql.Date, java.text.SimpleDateFormat
+import java.math.BigDecimal
+from java.lang import (
+  String,
+  Integer,
+  Long,
+  Double,
+  Boolean,
+)
 from helpers import (
   settings,
   fetch_to_array_dict,
@@ -11,30 +23,47 @@ from helpers import (
   get_elapsed_time,
   get_exception_message,
 )
+from jdbc import (
+  getJdbcConnection,
+)
 
 DATA_TYPE_MAP = {
   'varchar' : 'varchar',
-  'mediumint' : 'int',
-  'integer' : 'int',
-  'int' : 'int',
+  'varchar2' : 'varchar',
+  'mediumint' : 'numeric',
+  'integer' : 'numeric',
+  'int' : 'numeric',
   'money' : 'numeric',
   'numeric' : 'numeric',
+  'decimal' : 'numeric',
+  'number' : 'numeric',
   'date' : 'date',
   'datetime' : 'datetime',
   'character varying' : 'varchar',
 }
 
+
 class Conn:
   "A Database connection"
+  execute_many_limit = 1000
 
-  def __init__(self, cred):
+  def __init__(self, cred, pure_jdbc=False):
     self.table_columns = {}
     self.limit_templ = ''
     self.cred = cred
+    self.pure_jdbc = pure_jdbc
     self.conn = zxJDBC.connect(cred['url'], cred['username'], cred['password'], cred['driver'])
+      
     self.cursor = self.conn.cursor(True)  # Dynamic cursor
     self.convert_warned = False
+    self.convert_i_to_do = None
     self.get_type()
+
+    if self.pure_jdbc:
+      jdbc_str_template = "%s;user=%s;password=%s;" if self.type_ == 'sqlserver' else "%s?user=%s&password=%s"
+      jdbc_str =  jdbc_str_template % (cred['url'], cred['username'], cred['password'])
+      self.conn2 = getJdbcConnection(jdbc_str, cred['driver'])
+      self.conn2.setAutoCommit(False)
 
   def get_type(self):
     "Get databse conn type"
@@ -44,21 +73,25 @@ class Conn:
       self.type = "PostgreSQL"
       self.type_ = "postgres"
       self.limit_templ = 'LIMIT {}'
+      self.name_qual = '"'
 
     elif 'oracle' in url:
       self.type = "Oracle"
       self.type_ = "oracle"
       self.limit_templ = 'AND ROWNUM <= {}'
+      self.name_qual = '"'
 
     elif 'sqlserver' in url:
       self.type = "Microsoft SQL Server"
       self.type_ = "sqlserver"
       self.limit_templ = 'TOP {}'
+      self.name_qual = '"'
 
     elif 'mysql' in url:
       self.type = "MySQL"
       self.type_ = "mysql"
       self.limit_templ = 'LIMIT {}'
+      self.name_qual = '`'
     
     self.type = None
   
@@ -71,14 +104,112 @@ class Conn:
   
   def get_select_sql(self, table, limit=None):
     limit_str = self.limit_templ.format(limit) if limit else ''
-    sql='select {prefix} * from {from_table} WHERE 1=1 {where} {suffix}'.format(
-      prefix=limit_str if self.type_ == 'sqlserver' else '',
+    sql='select {limit2} * from {from_table} WHERE 1=1 {where} {limit}'.format(
+      limit2=limit_str if self.type_ == 'sqlserver' else '',
       from_table=table,
       where='',
-      suffix=limit_str if self.type_ != 'sqlserver' else ''
+      limit=limit_str if self.type_ != 'sqlserver' else ''
     )
     return sql
   
+  def get_insert_sql(self, table, names):
+    if self.type_ == 'oracle':
+      insert_statement = sql_insert['_into'].format(
+        table=table,
+        names=names,
+        values='{values}'
+      )
+    else:
+      insert_statement = sql_insert[self.type_].format(
+        table=table,
+        names=names,
+        values='{values}'
+      )
+    
+    return insert_statement
+  
+  def table_select(self, table, limit=None, fetch_all=True):
+    select_sql = self.get_select_sql(table, limit)
+    if parser_args.show_details: log(select_sql)
+    self.cursor.execute(select_sql)
+    if fetch_all:
+      return fetch_to_array_dict(self.cursor)
+  
+  def query_batch(self, statement, fields, data):
+    "run batch query"
+    if len(data) == 0 : return
+    values_placeh = '(' + ','.join(['?'] * len(fields)) + ')'
+
+    try:
+      data2 = []
+      for i, row in enumerate(data):
+        data2.append(row)
+        if (i+1) % self.execute_many_limit == 0:
+          if self.type_ == 'oracle':
+            sql_into = statement.format(values=values_placeh)
+            sql = sql_insert['oracle'].format(_into=' '.join([sql_into] * len(data2)))
+          else:
+            sql = statement.format(values=', '.join([values_placeh] * len(data2)))
+          self.cursor.execute(sql, list(chain(*data2)))  # executemany submits many times instead of once
+          data2 = []
+      
+      if len(data2) > 0:
+        if self.type_ == 'oracle':
+          sql_into = statement.format(values=values_placeh)
+          sql = sql_insert['oracle'].format(_into=' '.join([sql_into] * len(data2)))
+        else:
+          sql = statement.format(values=', '.join([values_placeh] * len(data2)))
+        self.cursor.execute(sql, list(chain(*data2)))  # executemany submits many times instead of once
+      
+      self.conn.commit()
+      
+    except:
+      if parser_args.show_details:
+        log(statement.format(values=values_placeh))
+        l = min(20,len(data))
+        log(data[:l-1])
+      
+      print(get_exception_message())
+      sys.exit(1)
+
+  def query_batch2(self, statement, fields, data):
+    "run batch query with JDBC Prepared Statement"
+    """ using prepared statements was about 60% slower than using
+    the cursor.execute method...I am not sure why. Other conn/cusor
+    must be closed."""
+    values_placeh = '(' + ','.join(['?'] * len(fields)) + ')'
+
+    sql = statement.format(
+      values=values_placeh,
+    )
+
+    preppedStmt = self.conn2.prepareStatement(sql)
+
+    for row in data:
+      for i, val in enumerate(row):
+        # log('%s - %r - %r' % (i, type(val), val))
+        if isinstance(val, String): preppedStmt.setString(i+1, val)
+        elif isinstance(val, java.sql.Date): preppedStmt.setDate(i+1, val)
+        elif isinstance(val, java.math.BigDecimal): preppedStmt.setBigDecimal(i+1, val)
+        elif isinstance(val, float): preppedStmt.setDouble(i+1, val)
+        elif isinstance(val, int): preppedStmt.setInt(i+1, val)
+        elif isinstance(val, long): preppedStmt.setLong(i+1, val)
+        else: preppedStmt.setString(i+1, str(val))
+      preppedStmt.addBatch()
+    
+    try:
+      preppedStmt.executeBatch()
+      self.conn2.commit()
+      
+    except:
+      if parser_args.show_details: log(sql)
+      if parser_args.show_details:
+        l = min(20,len(data))
+        log(data[:l-1])
+      
+      print(get_exception_message())
+      sys.exit(1)
+
   def fetch_size(self, size):
     
     def is_date(val):
@@ -91,31 +222,38 @@ class Conn:
     try:
       data = self.cursor.fetchmany(size)
     except zxJDBC.DatabaseError:
+      log('zxJDBC.DatabaseError...')
       return []
 
-    if self.type_ == 'sqlserver':
+    if self.type_ == 'sqlserver2':
       # check if contains date because it converts to string (datetime is fine)
-      i_to_check={i:False for i,d in enumerate(self.cursor.description) if d[1] == -9 and d[2] == 10 }
-      
-      rows_to_audit = min(10, len(data))
-      for ri in range(rows_to_audit):
-        row = data[ri]
-        for i in i_to_check:
-          if is_date(row[i]):
-            i_to_check[i] = True
-      
-      if any(i_to_check.values()):
-        if not self.convert_warned:
-          log(" >> Need to convert DATE values from string to datetime.. Will take longer than usual.")
-          self.convert_warned = True
 
-        i_to_do = [k for k,v in i_to_check.items() if v]
+      if self.convert_i_to_do == None:
+        i_to_check={i:False for i,d in enumerate(self.cursor.description) if d[1] == -9 and d[2] == 10 }
+        
+        rows_to_audit = min(100, len(data))
+        for ri in range(rows_to_audit):
+          row = data[ri]
+          for i in i_to_check:
+            if is_date(row[i]):
+              i_to_check[i] = True
+        
+        if any(i_to_check.values()):
+          i_to_do = [k for k,v in i_to_check.items() if v]
 
+          if not self.convert_warned:
+            log(" >> WARNING: Need to convert DATE values from string to datetime.. Will take longer than usual.")
+            self.convert_warned = True
+            self.convert_i_to_do = i_to_do
+            log(" >> WARNING: %r = %s" % ('convert_i_to_do', self.convert_i_to_do))
+      
+      if len(self.convert_i_to_do) > 0:
         data2 = []
         for row in data:
           row = list(row)
-          for i in i_to_do:
+          for i in self.convert_i_to_do:
             row[i] = datetime.datetime.strptime(row[i], '%Y-%m-%d')
+            # row[i] = convert_string_date(row[i])
           data2.append(row)
         return data2
 
@@ -160,6 +298,9 @@ def run_etl(s_conn,t_conn,source_table,
   if equal:
     for i, s_field in enumerate(s_fields):
       t_field = t_fields[i]
+      s_field.data_type = s_field.data_type.lower()
+      t_field.data_type = t_field.data_type.lower()
+
       if not s_field.data_type in DATA_TYPE_MAP:
         log('{} not in DATA_TYPE_MAP...'.format(s_field.data_type))
         equal = False
@@ -172,7 +313,7 @@ def run_etl(s_conn,t_conn,source_table,
       
       if DATA_TYPE_MAP[s_field.data_type] != DATA_TYPE_MAP[t_field.data_type]:
         log(' >> Field Type mismatch: {}.{} != {}.{}'.format(s_field.column_name, s_field.data_type,t_field.column_name, t_field.data_type))
-        equal = False
+        # equal = False
   
   if not equal:
     log(' >> Source / Target table structure not equal for: {} != {}'.format(source_table,target_table))
@@ -182,17 +323,18 @@ def run_etl(s_conn,t_conn,source_table,
   
   # Run ETL!
   
-  select_sql = s_conn.get_select_sql(source_table, limit)
-  if show_details: log(select_sql)
-
   etl_time_start = datetime.datetime.now()
-  s_conn.cursor.execute(select_sql)
+  s_conn.table_select(source_table, limit=limit, fetch_all=False)
 
-  insert_statement = 'INSERT INTO {table} ({names}) VALUES {values}'
-  names = ','.join(['"' + f['column_name'] + '"' for f in t_fields])
+  nq =  t_conn.name_qual
+  names = ','.join([nq + f['column_name'] + nq for f in t_fields])
+  insert_statement = t_conn.get_insert_sql(target_table, names)
+  
+  if show_details: log(insert_statement)
   
   record_count = 0
   inc = 0
+
   while True:
     data = s_conn.fetch_size(batch_size)
     if len(data) == 0: break
@@ -204,24 +346,7 @@ def run_etl(s_conn,t_conn,source_table,
       log('  > row {}...'.format(record_count))
       inc = 0
 
-    values_placeh = '(' + ','.join(['?'] * len(t_fields)) + ')'
-    insert_sql = insert_statement.format(
-      table=target_table,
-      names=names,
-      values=', '.join([values_placeh] * len(data)),
-    )
-
-    try:
-      t_conn.cursor.execute(insert_sql, list(chain(*data)))
-      t_conn.conn.commit()
-    except:
-      if show_details: log(insert_sql)
-      if show_details:
-        l = min(20,len(data))
-        log(data[:l-1])
-      
-      print(get_exception_message())
-      sys.exit(1)
+    t_conn.query_batch(insert_statement, t_fields, data)
   
   etl_time_delta = (datetime.datetime.now() - etl_time_start).total_seconds()
   log('Inserted {} records into {} in {} seconds [{} rec/sec].'.format(record_count, target_table, etl_time_delta, round(record_count/etl_time_delta,1)))
