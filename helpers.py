@@ -44,7 +44,7 @@ def log(text):
   # logger.info(text)
   print('{} >> {}'.format(datetime.datetime.now(), text))
 
-get_rec = lambda row, headers: dict2({h:row[i] for i,h in enumerate(headers)})
+get_rec = lambda row, headers: dict2({h.lower():row[i] for i,h in enumerate(headers)})
 
 # def get_rec(row, headers):
 #   rec = OrderedDict()
